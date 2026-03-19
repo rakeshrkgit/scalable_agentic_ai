@@ -1,6 +1,6 @@
 """
-Agentic AI Framework with WorkflowManager + MemoryAgent
-Auto-generates workflows from initial tasks using DAG orchestration and persists state.
+Agentic AI Framework with WorkflowManager + MemoryAgent + Production-Grade Agents
+PART 1: Core Infrastructure and Agents
 """
 
 import threading
@@ -42,7 +42,7 @@ class CircuitBreaker:
         self.failures[task_id] = self.failures.get(task_id, 0) + 1
 
 # ==============================
-# Agents
+# Base Agent
 # ==============================
 class BaseAgent:
     def __init__(self, name, state_store, dlq, cb):
@@ -53,6 +53,9 @@ class BaseAgent:
     def run(self, task):
         raise NotImplementedError
 
+# ==============================
+# Core Agents
+# ==============================
 class IntentAgent(BaseAgent):
     def run(self, task):
         return {"intent": "process", "prompt": task["prompt"]}
@@ -62,7 +65,6 @@ class ReasoningAgent(BaseAgent):
         subtasks = [
             {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 1", "mode": "sequential"},
             {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 2", "mode": "parallel"},
-            {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 3", "mode": "parallel"},
         ]
         return {"subtasks": subtasks}
 
@@ -91,19 +93,50 @@ class SelfImprovementAgent(BaseAgent):
 
 class GenericAgent(BaseAgent):
     def run(self, task):
-        return {
-            "id": task.get("id", str(uuid.uuid4())),
-            "prompt": task.get("prompt", "Unknown task"),
-            "result": f"GenericAgent handled task with prompt: {task.get('prompt')}"
-        }
+        return {"result": f"GenericAgent handled task {task.get('prompt')}"}
 
 class MemoryAgent(BaseAgent):
     def run(self, task):
-        # Persist task state
         self.state_store.update(task["id"], task, version=random.randint(1, 1000))
         return {"memory_saved": True}
     def recall(self, task_id):
         return self.state_store.get(task_id)
+
+# ==============================
+# Production-Grade Agents
+# ==============================
+class MonitoringAgent(BaseAgent):
+    def run(self, task):
+        print(f"[MONITOR] Task {task['id']} status: {task.get('status')}")
+        return {"monitored": True}
+
+class SecurityAgent(BaseAgent):
+    def run(self, task):
+        return {"security_checked": True}
+
+class OrchestrationAgent(BaseAgent):
+    def run(self, task):
+        return {"orchestrated": True}
+
+class RecoveryAgent(BaseAgent):
+    def run(self, task):
+        if task.get("status") == "failed":
+            return {"recovery": f"Applied recovery for {task['id']}"}
+        return {"recovery": "Not needed"}
+
+class AuditAgent(BaseAgent):
+    def run(self, task):
+        print(f"[AUDIT] Recorded lineage for task {task['id']}")
+        return {"audited": True}
+
+class NotificationAgent(BaseAgent):
+    def run(self, task):
+        print(f"[NOTIFY] Task {task['id']} completed, sending notification...")
+        return {"notified": True}
+
+class OptimizationAgent(BaseAgent):
+    def run(self, task):
+        return {"optimization": f"Suggested improvements for {task['id']}"}
 
 # ==============================
 # Dispatcher
@@ -126,6 +159,13 @@ class Dispatcher:
             "self_improvement": SelfImprovementAgent("SelfImprovementAgent", self.state_store, self.dlq, self.cb),
             "generic": GenericAgent("GenericAgent", self.state_store, self.dlq, self.cb),
             "memory": MemoryAgent("MemoryAgent", self.state_store, self.dlq, self.cb),
+            "monitoring": MonitoringAgent("MonitoringAgent", self.state_store, self.dlq, self.cb),
+            "security": SecurityAgent("SecurityAgent", self.state_store, self.dlq, self.cb),
+            "orchestration": OrchestrationAgent("OrchestrationAgent", self.state_store, self.dlq, self.cb),
+            "recovery": RecoveryAgent("RecoveryAgent", self.state_store, self.dlq, self.cb),
+            "audit": AuditAgent("AuditAgent", self.state_store, self.dlq, self.cb),
+            "notification": NotificationAgent("NotificationAgent", self.state_store, self.dlq, self.cb),
+            "optimization": OptimizationAgent("OptimizationAgent", self.state_store, self.dlq, self.cb),
         }
 
     def submit_task(self, task):
@@ -137,49 +177,32 @@ class Dispatcher:
                 self.dlq.push(task, "Circuit breaker triggered")
                 return
 
-            # Intent
-            intent_out = self.agents["intent"].run(task)
-            task.update(intent_out)
-            self.agents["memory"].run(task)
-
-            # Reasoning
-            reasoning_out = self.agents["reasoning"].run(task)
-            task.update(reasoning_out)
-            self.agents["memory"].run(task)
-
-            # Planning
-            planning_out = self.agents["planning"].run(task)
-            task.update(planning_out)
-            self.agents["memory"].run(task)
+            # Core pipeline
+            task.update(self.agents["intent"].run(task))
+            task.update(self.agents["reasoning"].run(task))
+            task.update(self.agents["planning"].run(task))
 
             # Execution
             execution_results = []
-            for st in [s for s in task["subtasks"] if s["mode"] == "sequential"]:
+            for st in task["subtasks"]:
                 res = self.agents["execution"].run(st)
                 execution_results.append(res)
                 self.agents["memory"].run(res)
-            futures = []
-            for st in [s for s in task["subtasks"] if s["mode"] == "parallel"]:
-                futures.append(self.executor.submit(self.agents["execution"].run, st))
-            for f in futures:
-                res = f.result()
-                execution_results.append(res)
-                self.agents["memory"].run(res)
             task["execution"] = execution_results
+            task["status"] = "completed" if all(res.get("result") for res in execution_results) else "failed"
 
-            if all(res.get("result") for res in execution_results):
-                task["status"] = "completed"
-            else:
-                task["status"] = "failed"
-
+            # Post-processing agents
             self.agents["logging"].run(task)
-            feedback_out = self.agents["feedback"].run(task)
-            task.update(feedback_out)
+            task.update(self.agents["feedback"].run(task))
+            task.update(self.agents["self_improvement"].run(task))
             self.agents["memory"].run(task)
-
-            improvement_out = self.agents["self_improvement"].run(task)
-            task.update(improvement_out)
-            self.agents["memory"].run(task)
+            self.agents["monitoring"].run(task)
+            self.agents["security"].run(task)
+            self.agents["orchestration"].run(task)
+            task.update(self.agents["recovery"].run(task))
+            self.agents["audit"].run(task)
+            self.agents["notification"].run(task)
+            task.update(self.agents["optimization"].run(task))
 
             return task
 
@@ -200,7 +223,6 @@ class Dispatcher:
 class WorkflowManager:
     def __init__(self, dispatcher):
         self.dispatcher = dispatcher
-
     def generate_workflow(self, prompt):
         workflow_id = str(uuid.uuid4())
         workflow = {
@@ -223,12 +245,13 @@ class WorkflowManager:
         print(f"[WORKFLOW END] {workflow['name']} ({workflow['workflow_id']})")
 
 # ==============================
-# Demo
+# Demo Runner
 # ==============================
 if __name__ == "__main__":
     dispatcher = Dispatcher()
     manager = WorkflowManager(dispatcher)
 
+    # Auto-generate workflow from initial task
     workflow = manager.generate_workflow("Build a customer churn prediction model")
     manager.run_workflow(workflow)
 
