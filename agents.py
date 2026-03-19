@@ -1,6 +1,6 @@
 """
-Agentic AI Framework with DAG Orchestration
-Simulated LLM calls with dummy outputs (no external API calls).
+Agentic AI Framework with WorkflowManager + MemoryAgent
+Auto-generates workflows from initial tasks using DAG orchestration and persists state.
 """
 
 import threading
@@ -13,11 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 # Core Infrastructure
 # ==============================
 class StateStore:
-    """Decentralized state management with versioning."""
     def __init__(self):
         self.state = {}
         self.lock = threading.Lock()
-
     def update(self, key, value, version):
         with self.lock:
             current_version = self.state.get(key, {}).get("version", 0)
@@ -25,7 +23,6 @@ class StateStore:
                 self.state[key] = {"value": value, "version": version}
                 return True
             return False
-
     def get(self, key):
         return self.state.get(key, {}).get("value")
 
@@ -62,11 +59,10 @@ class IntentAgent(BaseAgent):
 
 class ReasoningAgent(BaseAgent):
     def run(self, task):
-        # Create subtasks with sequential/parallel flags
         subtasks = [
-            {"id": str(uuid.uuid4()), "prompt": f"Subtask of {task['prompt']} #0", "mode": "sequential"},
-            {"id": str(uuid.uuid4()), "prompt": f"Subtask of {task['prompt']} #1", "mode": "parallel"},
-            {"id": str(uuid.uuid4()), "prompt": f"Subtask of {task['prompt']} #2", "mode": "parallel"},
+            {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 1", "mode": "sequential"},
+            {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 2", "mode": "parallel"},
+            {"id": str(uuid.uuid4()), "prompt": f"{task['prompt']} - Step 3", "mode": "parallel"},
         ]
         return {"subtasks": subtasks}
 
@@ -101,8 +97,16 @@ class GenericAgent(BaseAgent):
             "result": f"GenericAgent handled task with prompt: {task.get('prompt')}"
         }
 
+class MemoryAgent(BaseAgent):
+    def run(self, task):
+        # Persist task state
+        self.state_store.update(task["id"], task, version=random.randint(1, 1000))
+        return {"memory_saved": True}
+    def recall(self, task_id):
+        return self.state_store.get(task_id)
+
 # ==============================
-# Dispatcher with DAG Orchestration
+# Dispatcher
 # ==============================
 class Dispatcher:
     def __init__(self):
@@ -121,14 +125,11 @@ class Dispatcher:
             "feedback": FeedbackAgent("FeedbackAgent", self.state_store, self.dlq, self.cb),
             "self_improvement": SelfImprovementAgent("SelfImprovementAgent", self.state_store, self.dlq, self.cb),
             "generic": GenericAgent("GenericAgent", self.state_store, self.dlq, self.cb),
+            "memory": MemoryAgent("MemoryAgent", self.state_store, self.dlq, self.cb),
         }
 
-    def submit_task(self, prompt, agent_type="intent"):
-        task = {"id": str(uuid.uuid4()), "prompt": prompt, "status": "pending", "agent_type": agent_type}
+    def submit_task(self, task):
         self.task_queue.put(task)
-
-    def select_agent(self, agent_type):
-        return self.agents.get(agent_type, self.agents["generic"])
 
     def process_task(self, task):
         try:
@@ -136,44 +137,50 @@ class Dispatcher:
                 self.dlq.push(task, "Circuit breaker triggered")
                 return
 
-            agent = self.select_agent(task.get("agent_type"))
-            agent_out = agent.run(task)
-            task.update(agent_out)
+            # Intent
+            intent_out = self.agents["intent"].run(task)
+            task.update(intent_out)
+            self.agents["memory"].run(task)
 
-            if task.get("agent_type") == "intent":
-                reasoning_out = self.agents["reasoning"].run(task)
-                task.update(reasoning_out)
+            # Reasoning
+            reasoning_out = self.agents["reasoning"].run(task)
+            task.update(reasoning_out)
+            self.agents["memory"].run(task)
 
-                planning_out = self.agents["planning"].run(task)
-                task.update(planning_out)
+            # Planning
+            planning_out = self.agents["planning"].run(task)
+            task.update(planning_out)
+            self.agents["memory"].run(task)
 
-                execution_results = []
-                # Sequential subtasks first
-                for st in [s for s in task["subtasks"] if s["mode"] == "sequential"]:
-                    execution_results.append(self.agents["execution"].run(st))
+            # Execution
+            execution_results = []
+            for st in [s for s in task["subtasks"] if s["mode"] == "sequential"]:
+                res = self.agents["execution"].run(st)
+                execution_results.append(res)
+                self.agents["memory"].run(res)
+            futures = []
+            for st in [s for s in task["subtasks"] if s["mode"] == "parallel"]:
+                futures.append(self.executor.submit(self.agents["execution"].run, st))
+            for f in futures:
+                res = f.result()
+                execution_results.append(res)
+                self.agents["memory"].run(res)
+            task["execution"] = execution_results
 
-                # Parallel subtasks
-                futures = []
-                for st in [s for s in task["subtasks"] if s["mode"] == "parallel"]:
-                    futures.append(self.executor.submit(self.agents["execution"].run, st))
-                for f in futures:
-                    execution_results.append(f.result())
+            if all(res.get("result") for res in execution_results):
+                task["status"] = "completed"
+            else:
+                task["status"] = "failed"
 
-                task["execution"] = execution_results
+            self.agents["logging"].run(task)
+            feedback_out = self.agents["feedback"].run(task)
+            task.update(feedback_out)
+            self.agents["memory"].run(task)
 
-                # Parent completion check
-                if all(res.get("result") for res in execution_results):
-                    task["status"] = "completed"
-                else:
-                    task["status"] = "failed"
+            improvement_out = self.agents["self_improvement"].run(task)
+            task.update(improvement_out)
+            self.agents["memory"].run(task)
 
-                self.agents["logging"].run(task)
-                feedback_out = self.agents["feedback"].run(task)
-                task.update(feedback_out)
-                improvement_out = self.agents["self_improvement"].run(task)
-                task.update(improvement_out)
-
-            self.state_store.update(task["id"], task, version=random.randint(1, 1000))
             return task
 
         except Exception as e:
@@ -188,17 +195,42 @@ class Dispatcher:
             print(f"[RESULT] {result}")
 
 # ==============================
-# Stress Test
+# Workflow Manager
+# ==============================
+class WorkflowManager:
+    def __init__(self, dispatcher):
+        self.dispatcher = dispatcher
+
+    def generate_workflow(self, prompt):
+        workflow_id = str(uuid.uuid4())
+        workflow = {
+            "workflow_id": workflow_id,
+            "name": f"Workflow for {prompt}",
+            "tasks": []
+        }
+        parent_task = {"id": str(uuid.uuid4()), "prompt": prompt, "workflow_id": workflow_id, "status": "pending"}
+        workflow["tasks"].append(parent_task)
+        return workflow
+
+    def submit_workflow(self, workflow):
+        for task in workflow["tasks"]:
+            self.dispatcher.submit_task(task)
+
+    def run_workflow(self, workflow):
+        print(f"\n[WORKFLOW START] {workflow['name']} ({workflow['workflow_id']})")
+        self.submit_workflow(workflow)
+        self.dispatcher.run()
+        print(f"[WORKFLOW END] {workflow['name']} ({workflow['workflow_id']})")
+
+# ==============================
+# Demo
 # ==============================
 if __name__ == "__main__":
     dispatcher = Dispatcher()
-    # Submit DAG tasks
-    for i in range(30):
-        dispatcher.submit_task(f"Main Prompt {i}", agent_type="intent")
-    # Submit undefined task
-    dispatcher.submit_task("Undefined Prompt X", agent_type="unknown")
+    manager = WorkflowManager(dispatcher)
 
-    dispatcher.run()
+    workflow = manager.generate_workflow("Build a customer churn prediction model")
+    manager.run_workflow(workflow)
 
     print("\nDead Letter Queue:", dispatcher.dlq.queue)
     print("\nState Store:", dispatcher.state_store.state)
